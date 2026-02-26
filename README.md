@@ -1,92 +1,88 @@
-# Compile sail to WASM
+# sail-riscv-wasm
 
-You need to have docker installed
+Top-level product repository for the web-based Sail RISC-V runtime.
 
-## How to Use
+- `sail-riscv/` is a git submodule (tracked from `trdthg/sail-riscv:sail-riscv-wasm`).
+- `dependencies/` contains top-level toolchain/data submodules (`gmp-wasm`, `binutils-wasm`, `riscv-unified-db`).
+- `web/` is the deployable frontend app (GitHub Pages target).
+- `src/` stores top-level source files injected into the submodule before build.
 
-1. Run setup.sh
-2. Run build.sh
+## Repository layout
 
-## Steps
+- `sail-riscv/`: upstream model/build dependency (submodule)
+- `dependencies/`: wasm/tooling/data dependencies (submodules)
+- `web/`: frontend app, workers, tests, build output
+- `scripts/`: top-level orchestration scripts
+- `src/`: source files synced into submodule
+- `.github/workflows/gh-pages.yml`: top-level CI/CD entry
 
-1. Create setup.sh, prepare sail compiler, prepare zlib gmp and softfloat source code
+## Bootstrap
 
-	> The gmp repo I am using already contains a `build.sh` script, which will build gmp inside Docker and copy the output to local.
+```bash
+./scripts/bootstrap-submodules.sh
+```
 
-	```bash
-	wget https://github.com/rems-project/sail/releases/download/0.18-linux-binary/sail.tar.gz
-	tar -zxf sail.tar.gz
-	git clone --depth 1 https://github.com/OffchainLabs/SoftFloat.git
-	git clone --depth 1 https://github.com/Daninet/gmp-wasm.git
-	git clone --depth 1 https://github.com/riscv/sail-riscv.git
-	./gmp-wasm/binding/build-gmp.sh
-	```
+## Sync top-level sources into submodule
 
-2. Modify Makefile
+```bash
+./scripts/sync-sail-src.sh
+```
 
-	```diff
-	diff --git a/Makefile b/Makefile
-	index 2313d14..d03387e 100644
-	--- a/Makefile
-	+++ b/Makefile
-	@@ -150,9 +150,9 @@ C_WARNINGS ?=
-	 C_INCS = $(addprefix c_emulator/,riscv_prelude.h riscv_platform_impl.h riscv_platform.h riscv_softfloat.h)
-	 C_SRCS = $(addprefix c_emulator/,riscv_prelude.c riscv_platform_impl.c riscv_platform.c riscv_softfloat.c riscv_sim.c)
-	 
-	-SOFTFLOAT_DIR    = c_emulator/SoftFloat-3e
-	+SOFTFLOAT_DIR    = ../SoftFloat
-	 SOFTFLOAT_INCDIR = $(SOFTFLOAT_DIR)/source/include
-	-SOFTFLOAT_LIBDIR = $(SOFTFLOAT_DIR)/build/Linux-RISCV-GCC
-	+SOFTFLOAT_LIBDIR = $(SOFTFLOAT_DIR)/build/Wasm-Clang
-	 SOFTFLOAT_FLAGS  = -I $(SOFTFLOAT_INCDIR)
-	 SOFTFLOAT_LIBS   = $(SOFTFLOAT_LIBDIR)/softfloat.a
-	 SOFTFLOAT_SPECIALIZE_TYPE = RISCV
-	@@ -165,8 +165,8 @@ GMP_LIBS = $(shell pkg-config --libs gmp || echo -lgmp)
-	 ZLIB_FLAGS = $(shell pkg-config --cflags zlib)
-	 ZLIB_LIBS = $(shell pkg-config --libs zlib)
-	 
-	-C_FLAGS = -I $(SAIL_LIB_DIR) -I c_emulator $(GMP_FLAGS) $(ZLIB_FLAGS) $(SOFTFLOAT_FLAGS)
-	-C_LIBS  = $(GMP_LIBS) $(ZLIB_LIBS) $(SOFTFLOAT_LIBS)
-	+C_FLAGS = -I $(SAIL_LIB_DIR) -I /src/gmp-wasm/binding/gmp/dist/include -I c_emulator -I /src/zlib $(SOFTFLOAT_FLAGS)
-	+C_LIBS  = /src/gmp-wasm/binding/gmp/dist/lib/libgmp.a /src/zlib/libz.a $(SOFTFLOAT_LIBS)
-	 
-	 # The C simulator can be built to be linked against Spike for tandem-verification.
-	 # This needs the C bindings to Spike from https://github.com/SRI-CSL/l3riscv
-	@@ -256,6 +256,9 @@ rvfi: c_emulator/riscv_rvfi_$(ARCH)
-	 c_emulator/riscv_sim_$(ARCH): generated_definitions/c/riscv_model_$(ARCH).c $(C_INCS) $(C_SRCS) $(SOFTFLOAT_LIBS) Makefile
-	 	$(CC) -g $(C_WARNINGS) $(C_FLAGS) $< $(C_SRCS) $(SAIL_LIB_DIR)/*.c $(C_LIBS_WRAPPED) -o $@
-	 
-	+c_emulator/riscv_sim_$(ARCH).wasm:  generated_definitions/c/riscv_model_$(ARCH).c $(C_INCS) $(C_SRCS) $(SOFTFLOAT_LIBS) Makefile
-	+	emcc -g $(C_WARNINGS) $(C_FLAGS) $< $(C_SRCS) $(SAIL_LIB_DIR)/*.c $(C_LIBS) -o $@
-	+
-	 # Note: We have to add -c_preserve since the functions might be optimized out otherwise
-	 rvfi_preserve_fns=-c_preserve rvfi_set_instr_packet \
-	   -c_preserve rvfi_get_cmd \
-	
-	```
+Current synced source set includes:
 
-3. Create Dockerfile, based on the `emscripten/emsdk` image, which provides emsdk and clang-20. 	
+- `src/riscv_debug.cpp` (copied to `sail-riscv/c_emulator/riscv_debug.cpp`)
 
-	```Dockerfile
-	FROM emscripten/emsdk:latest
-	COPY . .
-	ENV PATH="${PATH}:/src/sail/bin:/emsdk/upstream/bin"
-	RUN git config --global user.email "you@example.com" && git config --global user.name "Your Name"
-	RUN wget https://www.zlib.net/zlib-1.3.1.tar.gz -O zlib.tar.gz \
-	    && tar -zxf zlib.tar.gz \
-	    && mv zlib-1.3.1 zlib \
-	    && cd zlib \
-	    && emconfigure ./configure \
-	    && emmake make -j$(nproc) || true
-	RUN cd sail-riscv && make c_emulator/wasm_riscv_sim_RV64
-	```
+## Build (all-in-one)
 
-4. Run `docker build`, and copy the result to local
+```bash
+./build.sh
+```
 
-	```build.sh
-	docker build -f Dockerfile . --tag=sail-riscv-wasm-builder:latest
-	
-	container_id=$(docker create sail-riscv-wasm-builder)
-	docker cp "$container_id:/src/sail-riscv/c_emulator/riscv_sim_RV64.wasm" "."
-	docker rm "$container_id"
-	```
+This runs: bootstrap → source sync → gmp wasm → sail wasm → binutils wasm.
+
+## Build step-by-step
+
+```bash
+./scripts/build-gmp-wasm.sh
+./scripts/build-sail-wasm.sh
+./scripts/build-binutils-wasm.sh
+```
+
+`build-sail-wasm.sh` supports two modes:
+
+- `SAIL_WASM_BUILD_MODE=superbuild` (default): uses top-level `CMakeLists.txt` wrapper target over the `sail-riscv` submodule
+- `SAIL_WASM_BUILD_MODE=legacy`: uses `sail-riscv/wasm/docker-run.sh`
+
+`build-binutils-wasm.sh` defaults to RISC-V-only + CJS outputs:
+
+- `GAS_TARGETS=riscv64-linux-gnu`
+- `GAS_BUILD_TYPES=cjs`
+- `BINUTILS_BUILD_TYPES=cjs`
+
+## Top-level CMake wrapper
+
+You can configure the superbuild directly:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target sail_riscv_wasm_debug -j
+```
+
+With Emscripten, use `sync_web_wasm_assets` to copy outputs into `web/public`.
+
+## Web development
+
+```bash
+pnpm -C web install
+pnpm -C web dev
+```
+
+## Web checks
+
+```bash
+pnpm -C web lint
+pnpm -C web typecheck
+pnpm -C web test:unit
+pnpm -C web test:ui
+REQUIRE_BINUTILS_ASSETS=1 pnpm -C web build
+```

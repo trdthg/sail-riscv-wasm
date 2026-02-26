@@ -1,0 +1,108 @@
+name: Deploy Web Demo
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+
+      - name: Bootstrap submodules
+        run: ./scripts/bootstrap-submodules.sh
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Cache GMP (wasm artifacts)
+        uses: actions/cache@v5
+        with:
+          path: |
+            dependencies/gmp-wasm/binding/gmp/src
+            dependencies/gmp-wasm/binding/gmp/dist
+            dependencies/gmp-wasm/binding/gmp/tune
+          key: gmp-${{ runner.os }}-${{ hashFiles('dependencies/gmp-wasm/binding/gmp/Dockerfile', 'dependencies/gmp-wasm/binding/build-gmp.sh') }}
+          restore-keys: |
+            gmp-${{ runner.os }}-
+
+      - name: Build GMP (wasm)
+        run: ./dependencies/gmp-wasm/binding/build-gmp.sh
+
+      - name: Sync sail src
+        run: ./scripts/sync-sail-src.sh
+
+      - name: Build sail wasm binaries
+        run: ./scripts/build-sail-wasm.sh
+
+      - name: Cache binutils-wasm artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            dependencies/binutils-wasm/.cache/binutils-gdb
+            dependencies/binutils-wasm/packages/gas/build/dist
+            dependencies/binutils-wasm/packages/binutils/build/dist
+          key: binutils-wasm-${{ runner.os }}-${{ hashFiles('dependencies/binutils-wasm/packages/gas/build/build.sh', 'dependencies/binutils-wasm/packages/gas/build/docker-run.sh', 'dependencies/binutils-wasm/packages/binutils/build/build.sh', 'dependencies/binutils-wasm/packages/binutils/build/docker-run.sh') }}
+          restore-keys: |
+            binutils-wasm-${{ runner.os }}-
+
+      - name: Build binutils wasm tools (riscv-only)
+        env:
+          BINUTILS_REPO_URL: https://sourceware.org/git/binutils-gdb.git
+          GAS_TARGETS: riscv64-linux-gnu
+          GAS_BUILD_TYPES: cjs
+        run: ./scripts/build-binutils-wasm.sh
+
+      - name: Verify binutils wasm artifacts
+        run: |
+          set -euxo pipefail
+          ls -lah dependencies/binutils-wasm/packages/gas/build/dist/cjs
+          ls -lah dependencies/binutils-wasm/packages/binutils/build/dist/cjs
+          test -f dependencies/binutils-wasm/packages/gas/build/dist/cjs/riscv64-linux-gnu.js
+          test -f dependencies/binutils-wasm/packages/binutils/build/dist/cjs/ld.js
+          test -f dependencies/binutils-wasm/packages/binutils/build/dist/cjs/readelf.js
+          test -f dependencies/binutils-wasm/packages/binutils/build/dist/cjs/objdump.js
+
+      - name: Install web dependencies
+        run: pnpm -C web install
+
+      - name: Run web lint
+        run: pnpm -C web lint
+
+      - name: Run web typecheck
+        run: pnpm -C web typecheck
+
+      - name: Run web unit tests
+        run: pnpm -C web test:unit
+
+      - name: Run web UI regression tests
+        run: pnpm -C web test:ui
+
+      - name: Build web
+        env:
+          BASE_PATH: /${{ github.event.repository.name }}/
+          REQUIRE_BINUTILS_ASSETS: '1'
+        run: pnpm -C web build
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: web/dist

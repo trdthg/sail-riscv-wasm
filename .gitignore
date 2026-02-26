@@ -1,5 +1,30 @@
-zlib*
-sail*
-gmp*
-SoftFloat
-riscv_sim_RV64.wasm
+# Build outputs
+/build/
+/build-emscripten-wrapper/
+
+# Local tool/work dirs
+/zlib*
+/gmp*
+/SoftFloat
+/sail*
+!/sail-riscv
+!/sail-riscv/
+/sail_smt_cache
+/riscv_sim_RV64.wasm
+
+# Editor
+/.vscode/
+
+# Generated web assets
+/web/public/sail_riscv_debug.js
+/web/public/sail_riscv_debug.wasm
+/web/public/wasm/*.js
+/web/public/wasm/*.wasm
+!/web/public/wasm/README.md
+/web/public/binutils/*.js
+!/web/public/binutils/README.md
+/web/public/udb/inst_index.json
+/web/public/config/*.json
+!/web/public/config/README.md
+
+sail-riscv/build-emscripten

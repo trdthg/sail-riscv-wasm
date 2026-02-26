@@ -1,36 +1,405 @@
-import { init, WASI } from '@wasmer/wasi';
+import { useAtom } from 'jotai';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { maybeWithBase } from './lib/paths';
+import { ExplorerPage } from './pages/ExplorerPage.jsx';
+import { RuntimePage } from './pages/RuntimePage.jsx';
+import { AppHeader } from './components/AppHeader';
+import { RuntimeKeepAliveSlot } from './components/runtime/RuntimeKeepAliveSlot';
+import { getRuntimeModule } from './lib/sailRuntime.js';
+import { useAsmAutocomplete } from './hooks/useAsmAutocomplete';
+import { useDebugWorkerRpc } from './hooks/useDebugWorkerRpc';
+import { useExplorerState } from './hooks/useExplorerState';
+import { scheduleMonacoPrewarm } from './lib/monacoPrewarm';
+import {
+  MAX_HEX,
+  binToHex,
+  clampHex,
+  formatBinWithCursor,
+  hexToBin,
+} from './lib/instructionInput';
+import { getOutputLines } from './lib/toolOutput';
+import { udbIndexLoadableAtom } from './lib/udbIndex.js';
+import {
+  configEditorAtom,
+  configEditorByPathAtom,
+  configPathAtom,
+  configsLoadableAtom,
+} from './state/configAtoms.js';
+import { isaLoadableAtom } from './state/isaAtoms.js';
+
+const PREFERRED_DEFAULT_CONFIG_PATH = '/config/rv64d_v128_e64.json';
 
 function App() {
+  const [configsState] = useAtom(configsLoadableAtom);
+  const [configPath, setConfigPath] = useAtom(configPathAtom);
+  const [isaState] = useAtom(isaLoadableAtom);
+  const [udbState] = useAtom(udbIndexLoadableAtom);
+  const [configEditor, setConfigEditor] = useAtom(configEditorAtom);
+  const [, setConfigEditorByPath] = useAtom(configEditorByPathAtom);
+  const [configEditorStatus, setConfigEditorStatus] = useState('');
+  const [configTemplatePath, setConfigTemplatePath] = useState('');
+  const [activePage, setActivePage] = useState('explorer');
+  const [runtimeEverMounted, setRuntimeEverMounted] = useState(false);
+  const [theme, setTheme] = useState(() => {
+    if (typeof window === 'undefined') return 'light';
+    return window.localStorage.getItem('sail-theme') === 'dark' ? 'dark' : 'light';
+  });
+  const applyTimerRef = useRef(null);
+  const asmInputRef = useRef(null);
+  const append = useCallback((line) => {
+    console.warn(line);
+  }, []);
+  const {
+    callDebugWorker,
+    setDebugWorkerLineSink,
+    resetDebugWorker,
+  } = useDebugWorkerRpc();
+
+  const setStatus = (text) => setConfigEditorStatus(text);
+  const isDark = theme === 'dark';
+  const editorTheme = isDark ? 'vs-dark' : 'vs';
+  const pageTitle = activePage === 'explorer' ? 'Instruction Explorer' : 'Build & Debug Runtime';
+  const brandTitle = 'sail-riscv-wasm';
+  const brandSubtitle = 'Browser-native RISC-V workbench built on sail-riscv.';
+
+  useEffect(() => {
+    window.__sailOutputSink = append;
+    return () => {
+      if (window.__sailOutputSink === append) {
+        window.__sailOutputSink = null;
+      }
+    };
+  }, [append]);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    document.documentElement.classList.toggle('dark', isDark);
+    window.localStorage.setItem('sail-theme', theme);
+  }, [isDark, theme]);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    document.title = `${pageTitle} · ${brandTitle}`;
+  }, [brandTitle, pageTitle]);
+
+  useEffect(() => {
+    scheduleMonacoPrewarm();
+  }, []);
+
+  useEffect(() => {
+    if (activePage === 'runtime' && !runtimeEverMounted) {
+      setRuntimeEverMounted(true);
+    }
+  }, [activePage, runtimeEverMounted]);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return undefined;
+    const prevBodyOverflow = document.body.style.overflow;
+    const prevHtmlOverflow = document.documentElement.style.overflow;
+    document.body.style.overflow = 'hidden';
+    document.documentElement.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prevBodyOverflow;
+      document.documentElement.style.overflow = prevHtmlOverflow;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (configsState.state !== 'hasData' || !Array.isArray(configsState.data) || configsState.data.length === 0) {
+      return;
+    }
+    const hasTemplate = configsState.data.some((cfg) => cfg.path === configTemplatePath);
+    if (hasTemplate) {
+      return;
+    }
+    const defaultTemplate =
+      configsState.data.find((cfg) => cfg.path === PREFERRED_DEFAULT_CONFIG_PATH) ||
+      configsState.data.find((cfg) => cfg.default) ||
+      configsState.data[0];
+    setConfigTemplatePath(defaultTemplate.path);
+  }, [configTemplatePath, configsState]);
+
+  const clearRuntimeTimers = useCallback(() => {
+    if (applyTimerRef.current) clearTimeout(applyTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    return () => clearRuntimeTimers();
+  }, [clearRuntimeTimers]);
+
+  const resolveConfigText = useCallback(async () => {
+    if (!configPath) {
+      append('No config available. Please refresh or check /config/configs.json.');
+      return null;
+    }
+    if (configPath === '/config.json') {
+      if (!configEditor.trim()) {
+        append('Runtime config (/config.json) is empty. Click Reset Config to load a template.');
+        return null;
+      }
+      return configEditor;
+    }
+    const configResp = await fetch(maybeWithBase(configPath));
+    if (!configResp.ok) {
+      append(`Failed to load config: ${configResp.status} ${configResp.statusText}`);
+      return null;
+    }
+    return await configResp.text();
+  }, [append, configEditor, configPath]);
+
+  const runTool = useCallback(async (args) => {
+    const Module = await getRuntimeModule();
+    const configText = await resolveConfigText();
+    if (!configText) return;
+    const fsConfigPath = '/config.json';
+    if (!Module.FS || !Module.FS.writeFile) {
+      append('Emscripten FS is not available');
+      return;
+    }
+    Module.FS.writeFile(fsConfigPath, configText);
+
+    try {
+      if (typeof Module.callMain === 'function') {
+        const lines = getOutputLines();
+        lines.length = 0;
+        Module.callMain(['web', '--config', fsConfigPath, ...args]);
+      } else {
+        append('No callMain exported from module');
+      }
+    } catch (e) {
+      if (typeof e === 'number') {
+        if (e !== 0) append(`ExitStatus (number): ${e}`);
+      } else if (e && typeof e.status === 'number') {
+        if (e.status !== 0) append(`ExitStatus: ${e.status}`);
+      } else {
+        console.error('Program exited:', e);
+        append(`Program exited: ${String(e)}`);
+      }
+    }
+    return [...getOutputLines()];
+  }, [append, resolveConfigText]);
+
+  const {
+    hexInput,
+    setHexInput,
+    binInput,
+    setBinInput,
+    assemblyInput,
+    setAssemblyInput,
+    assemblyStatus,
+    assemblyMessage,
+    setAssemblyMessage,
+    decodeMode,
+    setDecodeMode,
+    lastEditedRef,
+    binInputRef,
+    bitLayout,
+    currentInstruction,
+  } = useExplorerState({
+    append,
+    runTool,
+    configPath,
+    udbState,
+    isaState,
+  });
+
+  const {
+    asmOpen,
+    setAsmOpen,
+    asmHighlight,
+    setAsmHighlight,
+    asmDropdownPos,
+    setAsmFocused,
+    asmSuggestions,
+    applyAsmSuggestion,
+    autocompleteState,
+    autocompleteMessage,
+  } = useAsmAutocomplete({
+    assemblyInput,
+    setAssemblyInput,
+    asmInputRef,
+    udbState,
+  });
+
+  const renderUdbValue = (value) => {
+    if (!value) return null;
+    if (typeof value === 'string') return value;
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  };
+
+  const applyConfigToRuntime = async () => {
+    if (!configEditor.trim()) {
+      setStatus('Config editor is empty.');
+      return;
+    }
+    try {
+      const Module = await getRuntimeModule();
+      if (!Module.FS || !Module.FS.writeFile) {
+        setStatus('Emscripten FS is not available.');
+        return;
+      }
+      Module.FS.writeFile('/config.json', configEditor);
+      setConfigPath('/config.json');
+      setStatus('Config auto-saved to runtime (/config.json).');
+    } catch (err) {
+      console.error('applyConfigToRuntime:', err);
+      setStatus('Failed to apply config.');
+    }
+  };
+
+  const resetConfigFromTemplatePath = useCallback(async (targetTemplatePath) => {
+    if (configsState.state !== 'hasData' || !Array.isArray(configsState.data) || configsState.data.length === 0) {
+      setStatus('Config template list is unavailable.');
+      return false;
+    }
+    const requestedPath = typeof targetTemplatePath === 'string' ? targetTemplatePath : '';
+    const selectedTemplate =
+      configsState.data.find((cfg) => cfg.path === requestedPath) ||
+      configsState.data.find((cfg) => cfg.path === PREFERRED_DEFAULT_CONFIG_PATH) ||
+      configsState.data.find((cfg) => cfg.default) ||
+      configsState.data[0];
+    if (!selectedTemplate?.path) {
+      setStatus('No config template selected.');
+      return false;
+    }
+
+    try {
+      const resp = await fetch(maybeWithBase(selectedTemplate.path));
+      if (!resp.ok) {
+        setStatus(`Failed to load template: ${resp.status} ${resp.statusText}`);
+        return false;
+      }
+      const templateText = await resp.text();
+      setConfigEditorByPath({ path: '/config.json', text: templateText });
+      setConfigPath('/config.json');
+      setConfigTemplatePath(selectedTemplate.path);
+
+      try {
+        const Module = await getRuntimeModule();
+        if (Module.FS && Module.FS.writeFile) {
+          Module.FS.writeFile('/config.json', templateText);
+        }
+      } catch {
+        // runtime FS sync is best-effort; editor content is still updated
+      }
+
+      setStatus(`Config reset from template: ${selectedTemplate.label} → /config.json`);
+      return true;
+    } catch (err) {
+      console.error('loadConfigTemplateToEditor:', err);
+      setStatus('Failed to load config template.');
+      return false;
+    }
+  }, [configsState, setConfigEditorByPath, setConfigPath]);
+
+  const loadConfigTemplateToEditor = useCallback(async () => {
+    await resetConfigFromTemplatePath(configTemplatePath);
+  }, [configTemplatePath, resetConfigFromTemplatePath]);
+
+  const sharedPageProps = {
+    isDark,
+    configPath,
+    setConfigPath,
+    configsState,
+  };
+
+  const explorerPagePrivateProps = {
+    decodeMode,
+    setDecodeMode,
+    hexInput,
+    setHexInput,
+    binInput,
+    setBinInput,
+    assemblyInput,
+    setAssemblyInput,
+    assemblyStatus,
+    assemblyMessage,
+    setAssemblyMessage,
+    asmInputRef,
+    asmSuggestions,
+    asmOpen,
+    setAsmOpen,
+    asmHighlight,
+    setAsmHighlight,
+    asmDropdownPos,
+    setAsmFocused,
+    applyAsmSuggestion,
+    autocompleteState,
+    autocompleteMessage,
+    currentInstruction,
+    renderUdbValue,
+    configEditor,
+    setConfigEditor,
+    configTemplatePath,
+    setConfigTemplatePath,
+    loadConfigTemplateToEditor,
+    configEditorStatus,
+    applyTimerRef,
+    applyConfigToRuntime,
+    MAX_HEX,
+    lastEditedRef,
+    clampHex,
+    hexToBin,
+    formatBinWithCursor,
+    binToHex,
+    bitLayout,
+    binInputRef,
+  };
+
+  const runtimePagePrivateProps = {
+    editorTheme,
+    isActive: activePage === 'runtime',
+    configTemplatePath,
+    setConfigTemplatePath,
+    resetConfigFromTemplatePath,
+    callDebugWorker,
+    setDebugWorkerLineSink,
+    forceStopDebugWorker: resetDebugWorker,
+    resolveConfigText,
+  };
+
+  const explorerPageProps = {
+    ...sharedPageProps,
+    ...explorerPagePrivateProps,
+  };
+
+  const runtimePageProps = {
+    ...sharedPageProps,
+    ...runtimePagePrivateProps,
+  };
+
+  const pageContent = (
+    <RuntimeKeepAliveSlot
+      activePage={activePage}
+      runtimeEverMounted={runtimeEverMounted}
+      explorerContent={<ExplorerPage {...explorerPageProps} />}
+      runtimeContent={<RuntimePage {...runtimePageProps} />}
+    />
+  );
+
   return (
-    <>
-      <h1>sail-riscv on web</h1>
-      <div className="card">
-        <button onClick={async () => {
-          // This is needed to load the WASI library first (since is a Wasm module)
-          await init();
+    <div
+      className={`relative overflow-hidden ${
+        isDark
+          ? 'bg-gradient-to-b from-slate-950 via-slate-950 to-slate-900 text-slate-100'
+          : 'bg-gradient-to-b from-slate-100 via-slate-50 to-slate-100 text-slate-900'
+      } h-screen flex flex-col`}
+    >
+      <AppHeader
+        isDark={isDark}
+        activePage={activePage}
+        setActivePage={setActivePage}
+        setTheme={setTheme}
+        brandTitle={brandTitle}
+        brandSubtitle={brandSubtitle}
+      />
 
-          let args = []
-          let wasi = new WASI({
-            args: args
-          });
-
-          const moduleBytes = fetch("http://localhost:5173/riscv_sim_RV64.wasm");
-          const module = await WebAssembly.compileStreaming(moduleBytes);
-          // Instantiate the WASI module
-          await wasi.instantiate(module, {});
-
-          // Run the start function
-          let exitCode = wasi.start();
-          let stderr = wasi.getStderrString();
-          let stdout = wasi.getStdoutString();
-
-          console.log(`(exit code: ${exitCode})`)
-          console.log(`${stdout}`);
-        }}>
-          Run
-        </button>
-      </div>
-    </>
+      {pageContent}
+    </div>
   )
 }
 

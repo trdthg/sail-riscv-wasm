@@ -1,0 +1,13 @@
+[submodule "sail-riscv"]
+	path = sail-riscv
+	url = https://github.com/trdthg/sail-riscv.git
+	branch = sail-riscv-wasm
+[submodule "dependencies/gmp-wasm"]
+	path = dependencies/gmp-wasm
+	url = https://github.com/trdthg/gmp-wasm.git
+[submodule "dependencies/binutils-wasm"]
+	path = dependencies/binutils-wasm
+	url = https://github.com/mnixry/binutils-wasm.git
+[submodule "dependencies/riscv-unified-db"]
+	path = dependencies/riscv-unified-db
+	url = https://github.com/riscv/riscv-unified-db.git

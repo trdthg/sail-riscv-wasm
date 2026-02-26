@@ -1,6 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
 
-docker build -f Dockerfile . --tag=sail-riscv-wasm-builder:latest
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-container_id=$(docker create sail-riscv-wasm-builder)
-docker cp "$container_id:/src/sail-riscv/c_emulator/riscv_sim_RV64.wasm" "."
-docker rm "$container_id"
+"${repo_root}/scripts/bootstrap-submodules.sh"
+"${repo_root}/scripts/sync-sail-src.sh"
+"${repo_root}/scripts/build-gmp-wasm.sh"
+"${repo_root}/scripts/build-sail-wasm.sh"
+"${repo_root}/scripts/build-binutils-wasm.sh"
